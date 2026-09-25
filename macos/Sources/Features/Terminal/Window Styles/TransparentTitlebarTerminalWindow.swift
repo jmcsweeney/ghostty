@@ -12,10 +12,12 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
     private weak var observedTabGroup: NSWindowTabGroup?
     private var tabGroupWindowsObservation: NSKeyValueObservation?
     private var tabBarVisibleObservation: NSKeyValueObservation?
+    private var tabSelectionObservation: NSKeyValueObservation?
 
     deinit {
         tabGroupWindowsObservation?.invalidate()
         tabBarVisibleObservation?.invalidate()
+        tabSelectionObservation?.invalidate()
     }
 
     // MARK: NSWindow
@@ -28,8 +30,35 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         setupKVO()
     }
 
+    override func resignMain() {
+        super.resignMain()
+        scheduleTabBarBackgroundSync()
+    }
+
+    override func becomeKey() {
+        super.becomeKey()
+        scheduleTabBarBackgroundSync()
+    }
+
+    override func resignKey() {
+        super.resignKey()
+        scheduleTabBarBackgroundSync()
+    }
+
+    /// AppKit restyles the native tab bar after key/main transitions and tab
+    /// selection changes, undoing our material fixes. Re-apply on the next
+    /// runloop turns.
+    private func scheduleTabBarBackgroundSync() {
+        syncTabBarBackground()
+        DispatchQueue.main.async { [weak self] in self?.syncTabBarBackground() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
+            self?.syncTabBarBackground()
+        }
+    }
+
     override func becomeMain() {
         super.becomeMain()
+        scheduleTabBarBackgroundSync()
 
         guard let lastSurfaceConfig else { return }
         syncAppearance(lastSurfaceConfig)
@@ -54,6 +83,15 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
                 hideEffectView()
             }
         }
+
+        // Adding a tab rebuilds the tab bar lazily, after our KVO callbacks have
+        // already run. This runs once per event loop pass before display, so it is
+        // the earliest reliable point to fix the new bar up before it is drawn.
+        //
+        // Every call walks the titlebar view tree and the tab bar's layer tree,
+        // then rewrites the fill and every tint unconditionally. Windows without
+        // a tab bar bail out after the first walk.
+        syncTabBarBackground()
     }
 
     // MARK: Appearance
@@ -104,6 +142,92 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         // In all cases, we have to hide the background view since this has multiple subviews
         // that force a background color.
         titlebarBackgroundView?.isHidden = true
+
+        syncTabBarBackground()
+    }
+
+    /// On macOS 27 the native tab bar draws liquid glass that ignores the titlebar
+    /// colour, so the strip stays system grey whatever the terminal background is.
+    ///
+    /// The track's grey is a CoreUI material (`kCUIVariantContentBackgroundMaterial`)
+    /// whose `fill` sublayer is a fixed grey, composited over a `CABackdropLayer`
+    /// blur and then lifted by a vibrancy colour matrix. Repainting that fill and
+    /// dropping the matrix keeps the blur, the specular rim and the separators, so
+    /// the strip still reads as glass while taking the terminal's colour.
+    ///
+    /// The tab buttons are genuine `NSGlassEffectView`s, so they take the public
+    /// `tintColor` and keep their own glass rendering untouched. `NSSubduedGlassEffectView`,
+    /// which wraps the track, is not one and ignores `tintColor` entirely, so the
+    /// track needs the layer-level treatment and the buttons don't.
+    ///
+    /// Safe to call repeatedly; AppKit rebuilds the tab bar often so this runs from
+    /// every appearance sync and after every tab bar layout.
+    func syncTabBarBackground() {
+        guard #available(macOS 27, *) else { return }
+        guard let bg = preferredBackgroundColor, let tabBarView else { return }
+
+        // A glass background style deliberately leaves the titlebar clear so the
+        // glass shows through (see syncAppearanceTahoe). Painting an opaque fill
+        // into the track would punch a solid block through it, so leave the tab
+        // bar to the system in that case.
+        if derivedConfig.backgroundBlur.isGlassStyle,
+           derivedConfig.macosTitlebarStyle == .transparent ||
+            derivedConfig.macosTitlebarStyle == .tabs {
+            return
+        }
+
+        // We're poking raw CALayers, which pick up implicit animations. Without
+        // this the recolour fades in over 250ms every time AppKit rebuilds the
+        // tab bar, which reads as a flash of grey.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+
+        if let root = tabBarView.layer {
+            Self.forEachLayer(in: root) { layer in
+                switch layer.name {
+                case "NSTabBarTrackVibrantColorMatrix":
+                    // Lightens whatever sits beneath it, which drags the recoloured
+                    // fill well away from the terminal background.
+                    layer.isHidden = true
+
+                case "kCUIVariantContentBackgroundMaterial":
+                    for fill in layer.sublayers ?? [] where fill.name == "fill" {
+                        fill.backgroundColor = bg.cgColor
+                    }
+
+                default:
+                    break
+                }
+            }
+        }
+
+        let selectedIndex: Int? = tabGroup.flatMap { group in
+            group.selectedWindow.flatMap { group.windows.firstIndex(of: $0) }
+        }
+        let selectedTint = (bg.isLightColor
+            ? bg.shadow(withLevel: 0.10)
+            : bg.highlight(withLevel: 0.12)) ?? bg
+
+        // Reuses the tabBarView bound above; tabButtonsInVisualOrder() would walk
+        // the titlebar a second time to find the same view.
+        //
+        // Known limitation: selectedIndex is a position in the model order
+        // (`tabGroup.windows`) compared against visual order here. The two can
+        // disagree mid-drag or immediately after a tab is added, which briefly
+        // tints the wrong button until the next sync corrects it.
+        let buttons = tabBarView.descendants(withClassName: "NSTabButton")
+            .sorted { $0.frame.minX < $1.frame.minX }
+        for (index, button) in buttons.enumerated() {
+            guard let glass = button.firstDescendant(withClassName: "NSGlassEffectView")
+                    as? NSGlassEffectView else { continue }
+            glass.tintColor = index == selectedIndex ? selectedTint : bg
+        }
+    }
+
+    private static func forEachLayer(in layer: CALayer, _ body: (CALayer) -> Void) {
+        body(layer)
+        for sub in layer.sublayers ?? [] { forEachLayer(in: sub, body) }
     }
 
     @available(macOS 13.0, *)
@@ -141,7 +265,8 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
             let currentTabGroup = self.tabGroup
             let observationsValid = currentTabGroup == nil || (
                 self.tabGroupWindowsObservation != nil &&
-                self.tabBarVisibleObservation != nil
+                self.tabBarVisibleObservation != nil &&
+                self.tabSelectionObservation != nil
             )
 
             // Keep the existing observations when they already match.
@@ -150,6 +275,7 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
             self.observedTabGroup = currentTabGroup
             self.setupTabGroupObservation()
             self.setupTabBarVisibleObservation()
+            self.setupTabSelectionObservation()
         }
     }
 
@@ -198,6 +324,24 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
             guard let self else { return }
             guard let lastSurfaceConfig else { return }
             self.syncAppearance(lastSurfaceConfig)
+        }
+    }
+
+    /// Selecting a tab makes AppKit restyle the tab buttons over a short animation,
+    /// recreating the glass layers we neutralised. Re-apply a few times across it.
+    private func setupTabSelectionObservation() {
+        tabSelectionObservation?.invalidate()
+        tabSelectionObservation = nil
+        guard #available(macOS 27, *), let tabGroup else { return }
+
+        tabSelectionObservation = tabGroup.observe(\.selectedWindow, options: [.new]) { [weak self] _, _ in
+            guard let self else { return }
+            self.syncTabBarBackground()
+            for ms in [50, 150, 300, 600] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(ms)) { [weak self] in
+                    self?.syncTabBarBackground()
+                }
+            }
         }
     }
 
