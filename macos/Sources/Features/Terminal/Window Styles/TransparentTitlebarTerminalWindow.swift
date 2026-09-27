@@ -32,33 +32,33 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
 
     override func resignMain() {
         super.resignMain()
-        scheduleTabBarBackgroundSync()
+        scheduleTabBarStyleSync()
     }
 
     override func becomeKey() {
         super.becomeKey()
-        scheduleTabBarBackgroundSync()
+        scheduleTabBarStyleSync()
     }
 
     override func resignKey() {
         super.resignKey()
-        scheduleTabBarBackgroundSync()
+        scheduleTabBarStyleSync()
     }
 
     /// AppKit restyles the native tab bar after key/main transitions and tab
     /// selection changes, undoing our material fixes. Re-apply on the next
     /// runloop turns.
-    private func scheduleTabBarBackgroundSync() {
-        syncTabBarBackground()
-        DispatchQueue.main.async { [weak self] in self?.syncTabBarBackground() }
+    private func scheduleTabBarStyleSync() {
+        syncTabBarStyle()
+        DispatchQueue.main.async { [weak self] in self?.syncTabBarStyle() }
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
-            self?.syncTabBarBackground()
+            self?.syncTabBarStyle()
         }
     }
 
     override func becomeMain() {
         super.becomeMain()
-        scheduleTabBarBackgroundSync()
+        scheduleTabBarStyleSync()
 
         guard let lastSurfaceConfig else { return }
         syncAppearance(lastSurfaceConfig)
@@ -91,7 +91,7 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         // Every call walks the titlebar view tree and the tab bar's layer tree,
         // then rewrites the fill and every tint unconditionally. Windows without
         // a tab bar bail out after the first walk.
-        syncTabBarBackground()
+        syncTabBarStyle()
     }
 
     // MARK: Appearance
@@ -143,7 +143,7 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         // that force a background color.
         titlebarBackgroundView?.isHidden = true
 
-        syncTabBarBackground()
+        syncTabBarStyle()
     }
 
     /// On macOS 27 the native tab bar draws liquid glass that ignores the titlebar
@@ -160,21 +160,16 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
     /// which wraps the track, is not one and ignores `tintColor` entirely, so the
     /// track needs the layer-level treatment and the buttons don't.
     ///
+    /// The tabs are also squared off, pre-Tahoe style. The track and each tab's
+    /// clip use a NaN corner radius (a capsule derived from the height) and the
+    /// selected tab's glass has a 12pt radius; zeroing both gives flush square
+    /// segments. AppKit restores the capsule on resize, hence redoing it here.
+    ///
     /// Safe to call repeatedly; AppKit rebuilds the tab bar often so this runs from
     /// every appearance sync and after every tab bar layout.
-    func syncTabBarBackground() {
+    func syncTabBarStyle() {
         guard #available(macOS 27, *) else { return }
-        guard let bg = preferredBackgroundColor, let tabBarView else { return }
-
-        // A glass background style deliberately leaves the titlebar clear so the
-        // glass shows through (see syncAppearanceTahoe). Painting an opaque fill
-        // into the track would punch a solid block through it, so leave the tab
-        // bar to the system in that case.
-        if derivedConfig.backgroundBlur.isGlassStyle,
-           derivedConfig.macosTitlebarStyle == .transparent ||
-            derivedConfig.macosTitlebarStyle == .tabs {
-            return
-        }
+        guard let tabBarView else { return }
 
         // We're poking raw CALayers, which pick up implicit animations. Without
         // this the recolour fades in over 250ms every time AppKit rebuilds the
@@ -183,8 +178,22 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
 
+        // A glass background style deliberately leaves the titlebar clear so the
+        // glass shows through (see syncAppearanceTahoe). Painting an opaque fill
+        // into the track would punch a solid block through it, so only square
+        // the tab bar in that case.
+        let recolor = !(derivedConfig.backgroundBlur.isGlassStyle &&
+            (derivedConfig.macosTitlebarStyle == .transparent ||
+             derivedConfig.macosTitlebarStyle == .tabs))
+        guard recolor, let bg = preferredBackgroundColor else {
+            squareTabBar(tabBarView)
+            return
+        }
+
         if let root = tabBarView.layer {
             Self.forEachLayer(in: root) { layer in
+                Self.squareCorners(of: layer)
+
                 switch layer.name {
                 case "NSTabBarTrackVibrantColorMatrix":
                     // Lightens whatever sits beneath it, which drags the recoloured
@@ -221,7 +230,26 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         for (index, button) in buttons.enumerated() {
             guard let glass = button.firstDescendant(withClassName: "NSGlassEffectView")
                     as? NSGlassEffectView else { continue }
+            if glass.cornerRadius != 0 { glass.cornerRadius = 0 }
             glass.tintColor = index == selectedIndex ? selectedTint : bg
+        }
+    }
+
+    @available(macOS 26, *)
+    private func squareTabBar(_ tabBarView: NSView) {
+        if let root = tabBarView.layer {
+            Self.forEachLayer(in: root, Self.squareCorners)
+        }
+        for case let glass as NSGlassEffectView in tabBarView.descendants(withClassName: "NSGlassEffectView") {
+            if glass.cornerRadius != 0 { glass.cornerRadius = 0 }
+        }
+    }
+
+    private static func squareCorners(of layer: CALayer) {
+        // Assigning cornerRadius invalidates the layer even when unchanged, so
+        // only touch the rounded ones. NaN means "capsule" here.
+        if layer.cornerRadius.isNaN || layer.cornerRadius > 0 {
+            layer.cornerRadius = 0
         }
     }
 
@@ -336,10 +364,10 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
 
         tabSelectionObservation = tabGroup.observe(\.selectedWindow, options: [.new]) { [weak self] _, _ in
             guard let self else { return }
-            self.syncTabBarBackground()
+            self.syncTabBarStyle()
             for ms in [50, 150, 300, 600] {
                 DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(ms)) { [weak self] in
-                    self?.syncTabBarBackground()
+                    self?.syncTabBarStyle()
                 }
             }
         }
