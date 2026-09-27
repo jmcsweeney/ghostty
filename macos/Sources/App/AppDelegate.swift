@@ -150,6 +150,9 @@ class AppDelegate: NSObject,
 
     /// Manages updates
     let updateController = UpdateController()
+
+    /// Fork-only: "Check for Updates" rebuilds from upstream source instead.
+    let forkUpdater = ForkUpdater()
     var updateViewModel: UpdateViewModel {
         updateController.viewModel
     }
@@ -229,8 +232,8 @@ class AppDelegate: NSObject,
         // Initial config loading
         ghosttyConfigDidChange(config: ghostty.config)
 
-        // Start our update checker.
-        updateController.startUpdater()
+        // Fork-only: Sparkle is left stopped so it never offers official
+        // upstream builds over this fork. See ForkUpdater.
 
         // Register our service provider. This must happen after everything is initialized.
         NSApp.servicesProvider = ServiceProvider()
@@ -391,7 +394,7 @@ class AppDelegate: NSObject,
 
         // If we've already accepted to install an update, then we don't need to
         // confirm quit. The user is already expecting the update to happen.
-        if updateController.shouldTerminateWithoutWarning {
+        if updateController.shouldTerminateWithoutWarning || forkUpdater.isRestartingForUpdate {
             return .terminateNow
         }
 
@@ -959,7 +962,7 @@ class AppDelegate: NSObject,
     }
 
     @IBAction func checkForUpdates(_ sender: Any?) {
-        updateController.checkForUpdates()
+        forkUpdater.checkForUpdates()
         // UpdateSimulator.happyPath.simulate(with: updateViewModel)
     }
 
