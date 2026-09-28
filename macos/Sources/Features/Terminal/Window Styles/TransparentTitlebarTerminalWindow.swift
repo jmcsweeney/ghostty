@@ -148,25 +148,25 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
 
     /// On macOS 27 the native tab bar draws liquid glass that ignores the titlebar
     /// colour, so the strip stays system grey whatever the terminal background is.
+    /// This restyles it to look like the flat, squared pre-Tahoe tab bar: the
+    /// selected tab matches the terminal and the others sit on a slightly
+    /// lighter (or, for light themes, darker) strip.
     ///
     /// The track's grey is a CoreUI material (`kCUIVariantContentBackgroundMaterial`)
     /// whose `fill` sublayer is a fixed grey, composited over a `CABackdropLayer`
-    /// blur and then lifted by a vibrancy colour matrix. Repainting that fill and
-    /// dropping the matrix keeps the blur, the specular rim and the separators, so
-    /// the strip still reads as glass while taking the terminal's colour.
+    /// blur and then lifted by a vibrancy colour matrix. We repaint that fill and
+    /// drop the matrix.
     ///
-    /// The tab buttons are genuine `NSGlassEffectView`s, so they take the public
-    /// `tintColor` and keep their own glass rendering untouched. `NSSubduedGlassEffectView`,
-    /// which wraps the track, is not one and ignores `tintColor` entirely, so the
-    /// track needs the layer-level treatment and the buttons don't.
+    /// Only the selected (or hovered) tab's `NSGlassEffectView` actually renders
+    /// glass. See `flattenGlass` for how that is reduced to a plain fill.
     ///
-    /// The tabs are also squared off, pre-Tahoe style. The track and each tab's
-    /// clip use a NaN corner radius (a capsule derived from the height) and the
-    /// selected tab's glass has a 12pt radius; zeroing both gives flush square
-    /// segments. AppKit restores the capsule on resize, hence redoing it here.
+    /// Everything is squared off too. The track and each tab's clip use a NaN
+    /// corner radius (a capsule derived from the height) and the glass has a 12pt
+    /// radius; zeroing both gives flush square segments.
     ///
-    /// Safe to call repeatedly; AppKit rebuilds the tab bar often so this runs from
-    /// every appearance sync and after every tab bar layout.
+    /// Safe to call repeatedly; AppKit rebuilds the tab bar often (and restores
+    /// the capsule on resize) so this runs from every appearance sync and after
+    /// every tab bar layout.
     func syncTabBarStyle() {
         guard #available(macOS 27, *) else { return }
         guard let tabBarView else { return }
@@ -190,6 +190,9 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
             return
         }
 
+        let trackColor = Self.adjust(bg, by: 0.14)
+        let hoverColor = Self.adjust(bg, by: 0.22)
+
         if let root = tabBarView.layer {
             Self.forEachLayer(in: root) { layer in
                 Self.squareCorners(of: layer)
@@ -197,12 +200,12 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
                 switch layer.name {
                 case "NSTabBarTrackVibrantColorMatrix":
                     // Lightens whatever sits beneath it, which drags the recoloured
-                    // fill well away from the terminal background.
+                    // fill well away from the colour we set.
                     layer.isHidden = true
 
                 case "kCUIVariantContentBackgroundMaterial":
                     for fill in layer.sublayers ?? [] where fill.name == "fill" {
-                        fill.backgroundColor = bg.cgColor
+                        fill.backgroundColor = trackColor.cgColor
                     }
 
                 default:
@@ -214,9 +217,6 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         let selectedIndex: Int? = tabGroup.flatMap { group in
             group.selectedWindow.flatMap { group.windows.firstIndex(of: $0) }
         }
-        let selectedTint = (bg.isLightColor
-            ? bg.shadow(withLevel: 0.10)
-            : bg.highlight(withLevel: 0.12)) ?? bg
 
         // Reuses the tabBarView bound above; tabButtonsInVisualOrder() would walk
         // the titlebar a second time to find the same view.
@@ -224,15 +224,69 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         // Known limitation: selectedIndex is a position in the model order
         // (`tabGroup.windows`) compared against visual order here. The two can
         // disagree mid-drag or immediately after a tab is added, which briefly
-        // tints the wrong button until the next sync corrects it.
+        // paints the wrong button until the next sync corrects it.
         let buttons = tabBarView.descendants(withClassName: "NSTabButton")
             .sorted { $0.frame.minX < $1.frame.minX }
         for (index, button) in buttons.enumerated() {
+            // Titles blend through a vibrancy filter keyed off the track matrix we
+            // hid, which leaves unselected titles nearly invisible. Without it they
+            // draw in plain label / secondary label colours.
+            for title in button.descendants(withClassName: "NSTextField")
+            where title.layer?.compositingFilter != nil {
+                title.layer?.compositingFilter = nil
+            }
+
             guard let glass = button.firstDescendant(withClassName: "NSGlassEffectView")
                     as? NSGlassEffectView else { continue }
             if glass.cornerRadius != 0 { glass.cornerRadius = 0 }
-            glass.tintColor = index == selectedIndex ? selectedTint : bg
+            Self.flattenGlass(glass, fill: index == selectedIndex ? bg : hoverColor)
         }
+    }
+
+    /// Reduce a tab's glass to a flat fill with no rim.
+    ///
+    /// The glass is drawn by a SwiftUI renderer view next to the glass's content.
+    /// In its layer tree a plain `CALayer` holds the tint (a fill run through a
+    /// filter) and SwiftUI's effect stack is a set of layers named `@0`, `@1`,
+    /// ...: the backdrop blur, the rim and specular highlight, and a portal that
+    /// actually puts the tab's title on screen (the original is hidden). The
+    /// numbering shifts with the tab's contents, so we keep whichever effect
+    /// layer carries that portal and hide the rest. Tinting can't reach an exact
+    /// colour, so the fill is painted directly.
+    @available(macOS 26, *)
+    private static func flattenGlass(_ glass: NSGlassEffectView, fill: NSColor) {
+        let fillColor = fill.cgColor
+        let content = glass.contentView
+        for renderer in glass.subviews where !(content?.isDescendant(of: renderer) ?? false) {
+            guard let root = renderer.layer else { continue }
+            forEachLayer(in: root) { layer in
+                if layer.name?.hasPrefix("@") == true {
+                    if !showsContent(layer), !layer.isHidden { layer.isHidden = true }
+                } else if type(of: layer) == CALayer.self, let current = layer.backgroundColor {
+                    // Skip unchanged layers so the per-update sync doesn't redraw.
+                    if layer.filters != nil { layer.filters = nil }
+                    if current != fillColor { layer.backgroundColor = fillColor }
+                }
+            }
+        }
+    }
+
+    /// True if this layer is, or contains, a portal that displays another layer
+    /// in place of the original.
+    private static func showsContent(_ layer: CALayer) -> Bool {
+        if layer.responds(to: NSSelectorFromString("hidesSourceLayer")),
+           layer.value(forKey: "hidesSourceLayer") as? Bool == true {
+            return true
+        }
+        return (layer.sublayers ?? []).contains(where: showsContent)
+    }
+
+    /// Nudge a colour away from its own lightness: lighter for dark colours,
+    /// darker for light ones.
+    private static func adjust(_ color: NSColor, by level: CGFloat) -> NSColor {
+        (color.isLightColor
+            ? color.shadow(withLevel: level)
+            : color.highlight(withLevel: level)) ?? color
     }
 
     @available(macOS 26, *)
