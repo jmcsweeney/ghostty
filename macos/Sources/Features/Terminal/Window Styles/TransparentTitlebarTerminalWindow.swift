@@ -327,6 +327,13 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         titlebarAppearsTransparent = true
     }
 
+#if compiler(>=6.4)
+    @available(macOS 27.0, *)
+    final func reduceTabBarBackgroundGoldenGate() {
+        titlebarContainer?.firstDescendant(withClassName: "NSSubduedGlassEffectView")?.subviews.first?.alphaValue = 0.5
+    }
+#endif
+
     // MARK: View Finders
 
     private var titlebarBackgroundView: NSView? {
