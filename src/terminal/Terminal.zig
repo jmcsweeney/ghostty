@@ -17,6 +17,7 @@ const uucode = @import("uucode");
 const ansi = @import("ansi.zig");
 const modespkg = @import("modes.zig");
 const charsets = @import("charsets.zig");
+const xt_checksum = @import("xt_checksum.zig");
 const csi = @import("csi.zig");
 const hyperlink = @import("hyperlink.zig");
 const glyph = @import("apc/glyph.zig");
@@ -85,6 +86,10 @@ modes: modespkg.ModeState = .{},
 /// Terminal-level cursor state.
 cursor: Cursor = .{},
 
+/// The checksum variant DECRQCRA computes after RIS. The current variant
+/// is in `flags.xt_checksum`.
+default_xt_checksum: xt_checksum.Flags = .{},
+
 /// The most recently set mouse shape for the terminal.
 mouse_shape: mouse.Shape = .text,
 
@@ -119,6 +124,9 @@ flags: packed struct {
     /// then we want to capture the shift key for the mouse protocol
     /// if the configuration allows it.
     mouse_shift_capture: enum(u2) { null, false, true } = .null,
+
+    /// The checksum variant DECRQCRA computes, set via XTCHECKSUM.
+    xt_checksum: xt_checksum.Flags = .{},
 
     /// True if the window is focused.
     focused: bool = true,
@@ -293,6 +301,9 @@ pub const Options = struct {
     default_cursor_style: Screen.CursorStyle = .block,
     default_cursor_blink: ?bool = false,
 
+    /// The checksum variant DECRQCRA computes after RIS.
+    default_xt_checksum: xt_checksum.Flags = .{},
+
     /// The total storage limit for Kitty images in bytes. Has no effect
     /// if kitty images are disabled at build-time.
     kitty_image_storage_limit: usize = switch (build_options.artifact) {
@@ -355,7 +366,9 @@ pub fn init(
             .default_style = opts.default_cursor_style,
             .default_blink = opts.default_cursor_blink,
         },
+        .default_xt_checksum = opts.default_xt_checksum,
     };
+    result.flags.xt_checksum = opts.default_xt_checksum;
     result.setCursorStyle(.default);
     return result;
 }
@@ -395,6 +408,28 @@ pub fn vtStream(self: *Terminal) Stream {
 /// This is the handler-side only for vtStream.
 pub fn vtHandler(self: *Terminal) Stream.Handler {
     return .init(self);
+}
+
+/// Set the checksum variant restored by RIS. Like `ModeState.setDefault`,
+/// this also changes the current variant.
+pub fn setDefaultXtChecksum(self: *Terminal, flags: xt_checksum.Flags) void {
+    self.default_xt_checksum = flags;
+    self.flags.xt_checksum = flags;
+}
+
+/// Compute the DECRQCRA checksum of a rectangle of the active area,
+/// using the variant selected by XTCHECKSUM.
+pub fn rectXtChecksum(self: *const Terminal, req: xt_checksum.Request) u16 {
+    const origin: ?ScrollingRegion = if (self.modes.get(.origin))
+        self.scrolling_region
+    else
+        null;
+    const screen = self.screens.active;
+    return xt_checksum.compute(
+        screen,
+        req.selection(&screen.pages, origin),
+        self.flags.xt_checksum,
+    );
 }
 
 /// Change the cursor's current shape and blink behavior.
@@ -4931,27 +4966,26 @@ pub fn plainStringUnwrapped(self: *Terminal, alloc: Allocator) ![]const u8 {
 pub fn fullReset(self: *Terminal) void {
     // Ensure we're back on primary screen
     self.screens.switchTo(.primary);
-    self.screens.remove(
-        self.screens.active.alloc,
-        .alternate,
-    );
 
-    // Reset our screens
+    // Remove alternate screen
+    self.screens.remove(self.screens.active.alloc, .alternate);
+
+    // Reset primary screen
     self.screens.active.reset();
 
-    // Rest our basic state
-    const visible = self.flags.visible;
-    const resize_pull_scrollback = self.flags.resize_pull_scrollback;
-    self.modes.reset();
+    // Reset our basic state
     self.flags = .{
         // Visibility belongs to the view rather than terminal state, so a
         // terminal reset must not make a hidden view potentially visible.
-        .visible = visible,
+        .visible = self.flags.visible,
 
         // This is configuration based on the pty rather than terminal
         // state, so a terminal reset must not change it.
-        .resize_pull_scrollback = resize_pull_scrollback,
+        .resize_pull_scrollback = self.flags.resize_pull_scrollback,
+
+        .xt_checksum = self.default_xt_checksum,
     };
+    self.modes.reset();
     self.tabstops.reset(TABSTOP_INTERVAL);
     self.previous_char = null;
     self.pwd.clearRetainingCapacity();
@@ -4968,6 +5002,7 @@ pub fn fullReset(self: *Terminal) void {
         .right = self.cols - 1,
     };
     self.setCursorStyle(.default);
+    self.colors.palette.resetAll();
 
     // Always mark dirty so we redraw everything
     self.flags.dirty.clear = true;
@@ -14165,6 +14200,25 @@ test "Terminal: eraseLine complete resets wrap" {
     }
 }
 
+test "Terminal: eraseLine complete clears kitty placeholder flag" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    try t.print(kitty.graphics.unicode.placeholder);
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+        try testing.expect(list_cell.row.kitty_virtual_placeholder);
+    }
+    t.eraseLine(.complete, false);
+
+    const list_cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(!list_cell.row.kitty_virtual_placeholder);
+}
+
 test "Terminal: eraseLine complete protected attributes respected with iso" {
     const alloc = testing.allocator;
     const io_impl = testing.io;
@@ -15903,6 +15957,25 @@ test "Terminal: fullReset tracked pins" {
     try testing.expect(t.screens.active.pages.pinIsValid(p.*));
 }
 
+test "Terminal: default xt checksum survives resets" {
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 10,
+        .rows = 10,
+        .default_xt_checksum = .{ .positive = true },
+    });
+    defer t.deinit(testing.allocator);
+    try testing.expectEqual(xt_checksum.Flags{ .positive = true }, t.flags.xt_checksum);
+
+    t.flags.xt_checksum = .{ .full = true };
+    t.fullReset();
+    try testing.expectEqual(xt_checksum.Flags{ .positive = true }, t.flags.xt_checksum);
+
+    t.setDefaultXtChecksum(.{ .no_trim = true });
+    try testing.expectEqual(xt_checksum.Flags{ .no_trim = true }, t.flags.xt_checksum);
+    t.fullReset();
+    try testing.expectEqual(xt_checksum.Flags{ .no_trim = true }, t.flags.xt_checksum);
+}
+
 // https://github.com/mitchellh/ghostty/issues/272
 // This is also tested in depth in screen resize tests but I want to keep
 // this test around to ensure we don't regress at multiple layers.
@@ -15917,6 +15990,20 @@ test "Terminal: resize less cols with wide char then print" {
     try t.resize(alloc, .{ .cols = 2, .rows = 3 });
     t.setCursorPos(1, 2);
     try t.print('😀'); // 0x1F600
+}
+
+test "Terminal: resize less cols without reflow cutting wide char tail" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 3, .rows = 1 });
+    defer t.deinit(alloc);
+
+    try t.print('a');
+    try t.print('一');
+    t.modes.set(.wraparound, false);
+    try t.resize(alloc, .{ .cols = 2, .rows = 1 });
+
+    try testing.expect(t.screens.active.pages.getCell(.{ .active = .{ .x = 1 } }).?.cell.isEmpty());
 }
 
 // https://github.com/mitchellh/ghostty/issues/723
@@ -16126,6 +16213,66 @@ test "Terminal: resize with reflow and saved cursor pending wrap" {
         const str = try t.plainString(testing.allocator);
         defer testing.allocator.free(str);
         try testing.expectEqualStrings("1A2BX", str);
+    }
+}
+
+test "Terminal: saved cursor survives repeated widening" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 4, .rows = 5 });
+    defer t.deinit(alloc);
+
+    try t.printString("abc\nAAA|");
+    t.saveCursor();
+    try t.resize(alloc, .{ .cols = 5, .rows = 5 });
+    try t.resize(alloc, .{ .cols = 6, .rows = 5 });
+    t.restoreCursor();
+    try t.print('X');
+
+    const str = try t.plainString(alloc);
+    defer alloc.free(str);
+    try testing.expectEqualStrings("abc\nAAA|X", str);
+}
+
+test "Terminal: resize pending wrap live and saved cursors" {
+    const alloc = testing.allocator;
+    const cases = [_]struct {
+        text: []const u8,
+        cols: size.CellCountInt,
+        pending_wrap: bool,
+        expected: []const u8,
+    }{
+        // Widening leaves room after the formerly full line.
+        .{ .text = "ABCD", .cols = 6, .pending_wrap = false, .expected = "ABCDX" },
+        // Narrowing can move the last character into the middle of a row.
+        .{ .text = "ABCD", .cols = 3, .pending_wrap = false, .expected = "ABC\nDX" },
+        // Keep pending wrap when the last character still fills a row.
+        .{ .text = "ABCD", .cols = 2, .pending_wrap = true, .expected = "AB\nCD\nX" },
+        // A height-only resize also preserves pending wrap.
+        .{ .text = "ABCD", .cols = 4, .pending_wrap = true, .expected = "ABCD\nX" },
+        // Reflow can merge previously wrapped rows.
+        .{ .text = "ABCDEFGH", .cols = 6, .pending_wrap = false, .expected = "ABCDEF\nGHX" },
+        // A wide character at the old right edge must not be overwritten.
+        .{ .text = "AB界", .cols = 6, .pending_wrap = false, .expected = "AB界X" },
+        // A cursor without pending wrap must not advance an extra cell.
+        .{ .text = "ABC", .cols = 6, .pending_wrap = false, .expected = "ABCX" },
+    };
+
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |restore| {
+            var t = try init(testing.io, alloc, .{ .cols = 4, .rows = 5 });
+            defer t.deinit(alloc);
+            try t.printString(case.text);
+            if (restore) t.saveCursor();
+
+            try t.resize(alloc, .{ .cols = case.cols, .rows = 6 });
+            if (restore) t.restoreCursor();
+            try testing.expectEqual(case.pending_wrap, t.screens.active.cursor.pending_wrap);
+
+            try t.print('X');
+            const str = try t.plainString(alloc);
+            defer alloc.free(str);
+            try testing.expectEqualStrings(case.expected, str);
+        }
     }
 }
 
