@@ -37,6 +37,17 @@ if login_path="$("${SHELL:-/bin/zsh}" -l -c 'printenv PATH' 2>/dev/null | tail -
     export PATH="$login_path"
 fi
 
+# Homebrew's `zig` tracks the latest release, which can run ahead of what
+# Ghostty supports. Prefer a versioned keg (e.g. zig@0.16) matching
+# minimum_zig_version when one is installed.
+zig_minor="$(sed -nE 's/.*minimum_zig_version = "([0-9]+\.[0-9]+)\..*/\1/p' build.zig.zon)"
+for prefix in /opt/homebrew /usr/local; do
+    if [ -n "$zig_minor" ] && [ -x "$prefix/opt/zig@$zig_minor/bin/zig" ]; then
+        export PATH="$prefix/opt/zig@$zig_minor/bin:$PATH"
+        break
+    fi
+done
+
 fail() {
     echo "error: $*" >&2
     exit 1
