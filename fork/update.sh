@@ -82,7 +82,7 @@ cmd_check() {
     echo "upstream_count=$upstream_count"
     echo "total_count=$total_count"
     echo "---"
-    git log --no-merges --format='%s' "$installed..upstream/$BRANCH" | head -n 15
+    git log --no-merges --max-count=15 --format='%s' "$installed..upstream/$BRANCH"
 }
 
 cmd_build() {
