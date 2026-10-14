@@ -136,6 +136,8 @@ pub const Action = union(Key) {
     mouse_shape_reset,
     request_xt_checksum: xt_checksum.Request,
     xt_checksum_extension: XtChecksumExtension,
+    program_status: ProgramStatus,
+    soft_reset,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -242,6 +244,8 @@ pub const Action = union(Key) {
             "mouse_shape_reset",
             "request_xt_checksum",
             "xt_checksum_extension",
+            "program_status",
+            "soft_reset",
         },
     );
 
@@ -483,6 +487,8 @@ pub const Action = union(Key) {
     pub const KittyClipboard = osc.Command.KittyClipboardProtocol;
 
     pub const KittyDnd = osc.Command.KittyDndProtocol;
+
+    pub const ProgramStatus = osc.Command.ProgramStatus;
 };
 
 /// Returns a type that can process a stream of tty control characters.
@@ -2004,6 +2010,7 @@ pub fn Stream(comptime H: type) type {
                 'g' => switch (input.intermediates.len) {
                     0 => {
                         const mode: csi.TabClear = switch (input.params.len) {
+                            0 => .current,
                             1 => std.enums.fromInt(csi.TabClear, input.params[0]) orelse {
                                 log.warn("invalid tab clear mode: {}", .{input.params[0]});
                                 return;
@@ -2207,9 +2214,22 @@ pub fn Stream(comptime H: type) type {
                     }
                 },
 
-                // DECRQM - Request Mode
+                // DECRQM - Request Mode, DECSTR - Soft Terminal Reset
                 'p' => switch (input.intermediates.len) {
                     1, 2 => decrqm: {
+                        // DECSTR - Soft Terminal Reset
+                        if (input.intermediates.len == 1 and
+                            input.intermediates[0] == '!')
+                        {
+                            if (input.params.len != 0) {
+                                log.warn("invalid DECSTR command: {f}", .{input});
+                                break :decrqm;
+                            }
+
+                            self.handler.vt(.soft_reset, {});
+                            break :decrqm;
+                        }
+
                         const ansi_mode = ansi: {
                             switch (input.intermediates.len) {
                                 1 => if (input.intermediates[0] == '$') break :ansi true,
@@ -2448,10 +2468,17 @@ pub fn Stream(comptime H: type) type {
                                     .{input},
                                 ),
                                 18 => if (input.params.len == 1) {
-                                    // report screen size in characters
+                                    // report text area size in characters
                                     self.handler.vt(.size_report, .csi_18_t);
                                 } else log.warn(
                                     "ignoring CSI 18 t with extra parameters: {f}",
+                                    .{input},
+                                ),
+                                19 => if (input.params.len == 1) {
+                                    // report screen size in characters
+                                    self.handler.vt(.size_report, .csi_19_t);
+                                } else log.warn(
+                                    "ignoring CSI 19 t with extra parameters: {f}",
                                     .{input},
                                 ),
                                 21 => if (input.params.len == 1) {
@@ -2785,6 +2812,10 @@ pub fn Stream(comptime H: type) type {
 
                 .kitty_dnd_protocol => |v| {
                     self.handler.vt(.kitty_dnd, v);
+                },
+
+                .program_status => |v| {
+                    self.handler.vt(.program_status, v);
                 },
 
                 .unknown => |v| {
@@ -3508,6 +3539,36 @@ test "stream: ansi set mode (SM) and reset mode (RM)" {
     s.handler.mode = null;
     s.nextSlice("\x1B[>5h");
     try testing.expect(s.handler.mode == null);
+}
+
+test "stream: DECSTR dispatch" {
+    const H = struct {
+        calls: usize = 0,
+
+        pub fn vt(self: *@This(), comptime action: Action.Tag, value: Action.Value(action)) void {
+            _ = value;
+            switch (action) {
+                .soft_reset => self.calls += 1,
+                else => {},
+            }
+        }
+    };
+
+    const cases = [_]struct {
+        input: []const u8,
+        calls: usize,
+    }{
+        .{ .input = "\x1b[!p", .calls = 1 },
+        .{ .input = "\x1b[1!p", .calls = 0 },
+        .{ .input = "\x1b[?!p", .calls = 0 },
+        .{ .input = "\x1b[$p", .calls = 0 },
+    };
+
+    for (cases) |case| {
+        var s: Stream(H) = .init(.{ .handler = .{} });
+        s.nextSlice(case.input);
+        try testing.expectEqual(case.calls, s.handler.calls);
+    }
 }
 
 test "stream: DECRQCRA dispatch" {
@@ -4400,6 +4461,9 @@ test "stream: send report with CSI t" {
     s.nextSlice("\x1b[18t");
     try testing.expectEqual(csi.SizeReportStyle.csi_18_t, s.handler.style);
 
+    s.nextSlice("\x1b[19t");
+    try testing.expectEqual(csi.SizeReportStyle.csi_19_t, s.handler.style);
+
     s.nextSlice("\x1b[21t");
     try testing.expectEqual(csi.SizeReportStyle.csi_21_t, s.handler.style);
 }
@@ -4755,6 +4819,36 @@ test "stream: SGR with 17+ parameters for underline color" {
     // This tests the fix where param 17 was being dropped
     s.nextSlice("\x1b[4:3;38;2;51;51;51;48;2;170;170;170;58;2;255;97;136;0m");
     try testing.expect(s.handler.called);
+}
+
+test "stream: tab clear with no param clears the current stop" {
+    const H = struct {
+        action: ?Action.Tag = null,
+
+        pub fn vt(
+            self: *@This(),
+            comptime action: Action.Tag,
+            value: Action.Value(action),
+        ) void {
+            _ = value;
+            switch (action) {
+                .tab_clear_current, .tab_clear_all => self.action = action,
+                else => {},
+            }
+        }
+    };
+
+    var s: Stream(H) = .init(.{ .handler = .{} });
+    s.nextSlice("\x1b[g");
+    try testing.expectEqual(@as(?Action.Tag, .tab_clear_current), s.handler.action);
+
+    s.handler.action = null;
+    s.nextSlice("\x1b[0g");
+    try testing.expectEqual(@as(?Action.Tag, .tab_clear_current), s.handler.action);
+
+    s.handler.action = null;
+    s.nextSlice("\x1b[3g");
+    try testing.expectEqual(@as(?Action.Tag, .tab_clear_all), s.handler.action);
 }
 
 test "stream: tab clear with overflowing param" {
