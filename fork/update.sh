@@ -37,17 +37,6 @@ if login_path="$("${SHELL:-/bin/zsh}" -l -c 'printenv PATH' 2>/dev/null | tail -
     export PATH="$login_path"
 fi
 
-# Homebrew's `zig` tracks the latest release, which can run ahead of what
-# Ghostty supports. Prefer a versioned keg (e.g. zig@0.16) matching
-# minimum_zig_version when one is installed.
-zig_minor="$(sed -nE 's/.*minimum_zig_version = "([0-9]+\.[0-9]+)\..*/\1/p' build.zig.zon)"
-for prefix in /opt/homebrew /usr/local; do
-    if [ -n "$zig_minor" ] && [ -x "$prefix/opt/zig@$zig_minor/bin/zig" ]; then
-        export PATH="$prefix/opt/zig@$zig_minor/bin:$PATH"
-        break
-    fi
-done
-
 fail() {
     echo "error: $*" >&2
     exit 1
@@ -64,6 +53,21 @@ require_clean_main() {
         fail "checkout is on '${current:-detached HEAD}', expected '$BRANCH'"
     git diff --quiet && git diff --cached --quiet ||
         fail "checkout has uncommitted changes; commit or stash them first"
+}
+
+# Homebrew's `zig` tracks the latest release, which can run ahead of what
+# Ghostty supports. Prefer a versioned keg (e.g. zig@0.16) matching
+# minimum_zig_version when one is installed. Call this after merging, since
+# upstream may have bumped minimum_zig_version.
+select_zig() {
+    local zig_minor prefix
+    zig_minor="$(sed -nE 's/.*minimum_zig_version = "([0-9]+\.[0-9]+)\..*/\1/p' build.zig.zon)"
+    for prefix in /opt/homebrew /usr/local; do
+        if [ -n "$zig_minor" ] && [ -x "$prefix/opt/zig@$zig_minor/bin/zig" ]; then
+            export PATH="$prefix/opt/zig@$zig_minor/bin:$PATH"
+            break
+        fi
+    done
 }
 
 # The commit the installed app was built from, falling back to HEAD for
@@ -112,7 +116,8 @@ cmd_build() {
         fi
     done
 
-    log "Building (zig build -Doptimize=ReleaseFast)"
+    select_zig
+    log "Building with zig $(zig version) (zig build -Doptimize=ReleaseFast)"
     zig build -Doptimize=ReleaseFast
     [ -d "$BUILT_APP" ] || fail "build finished but $BUILT_APP is missing"
     git rev-parse HEAD >"$BUILT_COMMIT_FILE"
